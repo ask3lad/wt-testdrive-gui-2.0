@@ -1,5 +1,5 @@
 """
-Ask3lad War Thunder Test Drive GUI 2.3
+Ask3lad War Thunder Test Drive GUI 2.5
 ---------------------------------------
 A PyQt6 desktop application for customising Ask3lad's custom War Thunder
 missions. These are community missions created and distributed by Ask3lad —
@@ -28,18 +28,174 @@ next to this script.
 import sys
 import os
 import json
+import math
+import re
 import webbrowser
 import urllib.request
 import random
+import traceback
+import datetime
 
 from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QLineEdit, QListWidget, QListWidgetItem, QPushButton, QLabel,
     QFileDialog, QMessageBox, QTabWidget, QComboBox, QGroupBox, QDialog, QGridLayout, QButtonGroup,
-    QInputDialog, QSlider, QSpinBox, QDoubleSpinBox, QDial, QCheckBox
+    QInputDialog, QSlider, QSpinBox, QDoubleSpinBox, QDial, QCheckBox, QRadioButton
 )
 from PyQt6.QtCore import Qt, QThread, QTimer, pyqtSignal
 from PyQt6.QtGui import QIcon, QPixmap, QAction, QColor, QPalette
+
+
+# ── Crash Logger ─────────────────────────────────────────────────────────────
+# When running as a PyInstaller exe, __file__ points to the temp extraction
+# directory, not the exe's real location. Use sys.executable instead.
+if getattr(sys, 'frozen', False):
+    _APP_DIR = os.path.dirname(sys.executable)
+else:
+    _APP_DIR = os.path.dirname(os.path.abspath(__file__))
+_LOGS_DIR  = os.path.join(_APP_DIR, "Logs")
+_MAX_CRASHES = 10
+
+def _collect_app_state():
+    """Collect current app state from the running GUI window, if available."""
+    try:
+        app = QApplication.instance()
+        if not app:
+            return "  App not initialised\n"
+        for widget in app.topLevelWidgets():
+            if isinstance(widget, QMainWindow):
+                w = widget
+                break
+        else:
+            return "  Window not found\n"
+
+        lines = []
+        mode = getattr(w, "mode_tabs", None)
+        mode_name = "Ground" if (mode and mode.currentIndex() == 0) else "Naval"
+        lines.append(f"  Mode:                {mode_name}")
+
+        # Ground state
+        lines.append("")
+        lines.append("  [Ground]")
+        vid = getattr(w, "Current_Vehicle_ID", None)
+        lines.append(f"  Selected Vehicle:    {vid or 'Not set'}")
+
+        wo_mode = getattr(w, "weapon_override_mode", "none")
+        if wo_mode != "none":
+            donor = (getattr(w, "weapon_override_donor_id", "")
+                     or getattr(w, "naval_weapon_override_donor_id", "")
+                     or getattr(w, "aircraft_weapon_override_donor_id", ""))
+            weapon_blk = (getattr(w, "weapon_override_current_weapon_blk", "")
+                          or getattr(w, "naval_weapon_override_current_weapon_blk", "")
+                          or getattr(w, "aircraft_weapon_override_current_weapon_blk", ""))
+            weapon_name = weapon_blk.split("/")[-1].replace(".blk", "") if weapon_blk else "Not set"
+            lines.append(f"  Weapon Override:     {wo_mode} / {donor or 'Not set'} / {weapon_name}")
+            vel_active = getattr(w, "velocity_override_active", False)
+            cal_active = getattr(w, "caliber_override_active", False)
+            lines.append(f"  Velocity Override:   {'Enabled' if vel_active else 'Disabled'}")
+            lines.append(f"  Caliber Override:    {'Enabled' if cal_active else 'Disabled'}")
+            wt_dir = getattr(w, "_wt_dir", None)
+            if wt_dir and (vel_active or cal_active):
+                big_path = os.path.join(wt_dir, 'content', 'pkg_local',
+                                        'gameData', 'weapons', 'ask3lad', 'Ask3ladBigWeaponSir.blk')
+                lines.append(f"  BigWeaponSir.blk path: {big_path}")
+                if os.path.exists(big_path):
+                    try:
+                        with open(big_path, encoding="utf-8") as _f:
+                            lines.append("  BigWeaponSir.blk contents:")
+                            for _line in _f.read().splitlines():
+                                lines.append(f"    {_line}")
+                    except Exception as _e:
+                        lines.append(f"  (Could not read BigWeaponSir.blk: {_e})")
+                else:
+                    lines.append("  BigWeaponSir.blk: (not found)")
+        else:
+            lines.append(f"  Weapon Override:     None")
+
+        lines.append(f"  Target 03:           {getattr(w, 'target03_id', None) or 'Not set'}")
+        lines.append(f"  Target 04:           {getattr(w, 'target04_id', None) or 'Not set'}")
+        lines.append(f"  Target 05:           {getattr(w, 'target05_id', None) or 'Not set'}")
+        lines.append(f"  Moving Target:       {getattr(w, 'target06_id', None) or 'Not set'}")
+        lines.append(f"  Naval Target:        {getattr(w, 'ship_target_id', None) or 'Not set'}")
+        lines.append(f"  Air 01 (5km):        {getattr(w, 'air01_id', None) or 'Not set'}")
+        lines.append(f"  Air 02 (2.5km):      {getattr(w, 'air02_id', None) or 'Not set'}")
+        lines.append(f"  Helicopter (2km):    {getattr(w, 'heli_id', None) or 'Not set'}")
+
+        # Naval state
+        lines.append("")
+        lines.append("  [Naval]")
+        lines.append(f"  You (Naval):         {getattr(w, 'current_naval_vehicle_id', None) or 'Not set'}")
+        lines.append(f"  Target 01:           {getattr(w, 'naval_target01_id', None) or 'Not set'}")
+        lines.append(f"  Target 02:           {getattr(w, 'naval_target02_id', None) or 'Not set'}")
+        lines.append(f"  Target 03:           {getattr(w, 'naval_target03_id', None) or 'Not set'}")
+        lines.append(f"  Target 04:           {getattr(w, 'naval_target04_id', None) or 'Not set'}")
+        lines.append(f"  Air 01:              {getattr(w, 'naval_air01_id', None) or 'Not set'}")
+        lines.append(f"  Air 02:              {getattr(w, 'naval_air02_id', None) or 'Not set'}")
+
+        return "\n".join(lines) + "\n"
+    except Exception as e:
+        return f"  (Could not collect state: {e})\n"
+
+
+def _write_crash_log(exc_type, exc_value, exc_tb):
+    """Write a timestamped crash report to Logs/crash_YYYY-MM-DD_HH-MM-SS.txt."""
+    try:
+        os.makedirs(_LOGS_DIR, exist_ok=True)
+
+        # Prune old logs if over limit
+        existing_logs = sorted(
+            f for f in os.listdir(_LOGS_DIR) if f.startswith("crash_") and f.endswith(".txt")
+        )
+        while len(existing_logs) >= _MAX_CRASHES:
+            os.remove(os.path.join(_LOGS_DIR, existing_logs.pop(0)))
+
+        timestamp     = datetime.datetime.now()
+        crash_log     = os.path.join(_LOGS_DIR, f"crash_{timestamp.strftime('%Y-%m-%d_%H-%M-%S')}.txt")
+        tb_lines      = traceback.format_exception(exc_type, exc_value, exc_tb)
+        tb_str        = "".join(tb_lines)
+        state_str     = _collect_app_state()
+
+        report = (
+            f"{'=' * 60}\n"
+            f"CRASH REPORT\n"
+            f"Timestamp:  {timestamp.strftime('%Y-%m-%d %H:%M:%S')}\n"
+            f"Version:    {APP_VERSION}\n"
+            f"\n"
+            f"--- Exception ---\n"
+            f"Type:       {exc_type.__name__}\n"
+            f"Message:    {exc_value}\n"
+            f"\n"
+            f"--- Traceback ---\n"
+            f"{tb_str}\n"
+            f"--- App State ---\n"
+            f"{state_str}"
+        )
+
+        with open(crash_log, "w", encoding="utf-8") as f:
+            f.write(report)
+
+        return crash_log
+    except Exception:
+        return None  # Never let the crash logger itself crash
+
+
+def _crash_handler(exc_type, exc_value, exc_tb):
+    """Global unhandled exception hook — log then show a dialog."""
+    crash_log = _write_crash_log(exc_type, exc_value, exc_tb)
+    try:
+        from PyQt6.QtWidgets import QMessageBox
+        msg = QMessageBox()
+        msg.setWindowTitle("Unexpected Error")
+        msg.setIcon(QMessageBox.Icon.Critical)
+        msg.setText(
+            f"The application encountered an unexpected error and needs to close.\n\n"
+            f"A crash report has been saved to:\n{crash_log or _LOGS_DIR}\n\n"
+            f"Please send this file to Ask3lad so the issue can be fixed."
+        )
+        msg.exec()
+    except Exception:
+        pass
+    sys.__excepthook__(exc_type, exc_value, exc_tb)
 
 
 # ── Path helpers ──────────────────────────────────────────────────────────────
@@ -50,7 +206,7 @@ def _app_dir():
     return os.path.dirname(os.path.abspath(__file__))
 
 # ── App Version ───────────────────────────────────────────────────────────────
-APP_VERSION     = "2.3"
+APP_VERSION     = "2.5"
 _APP_VERSION_URL = "https://raw.githubusercontent.com/ask3lad/wt-testdrive-db/main/app_version.json"
 
 # ── War Thunder auto-detect paths ─────────────────────────────────────────────
@@ -81,7 +237,10 @@ _DB_FILES = [
     "Ships2.0_DB.json",
     "Plane2.0_DB.json",
     "Helicopter2.0_DB.json",
-    "ammo_names.json",
+    "AmmoNames2.0_DB.json",
+    "Weapons2.0_DB.json",
+    "NavalWeapons2.0_DB.json",
+    "AircraftWeapons2.0_DB.json",
     "db_version.json",
 ]
 
@@ -303,7 +462,7 @@ class VehiclePickerDialog(QDialog):
         preview_layout.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.preview = QLabel()
         self.preview.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.preview.setFixedSize(150, 150)
+        self.preview.setFixedSize(120, 120)
         preview_layout.addWidget(self.preview)
         self.preview_name = QLabel("-")
         self.preview_name.setAlignment(Qt.AlignmentFlag.AlignCenter)
@@ -348,7 +507,7 @@ class VehiclePickerDialog(QDialog):
         self.preview_name.setText(current.text())
         image_path = os.path.join(self.assets_folder, "Vehicle_Previews", self.subfolder, f"{vehicle_id}.png")
         if os.path.exists(image_path):
-            pixmap = QPixmap(image_path).scaled(150, 150, Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation)
+            pixmap = QPixmap(image_path).scaled(120, 120, Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation)
             self.preview.setPixmap(pixmap)
         else:
             self.preview.clear()
@@ -528,8 +687,8 @@ class WarThunderTestDriveGUI(QMainWindow):
 
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("Ask3lad War Thunder Test Drive GUI 2.3")
-        self.setMinimumSize(700, 550)
+        self.setWindowTitle("Ask3lad War Thunder Test Drive GUI 2.5")
+        self.setMinimumSize(700, 900)
 
         self.assets_folder = os.path.join(_app_dir(), "Assets")
 
@@ -573,23 +732,47 @@ class WarThunderTestDriveGUI(QMainWindow):
         self.current_environment = None
         self.current_weather = None
         self.current_target03_id = None
+        self.current_target03_rotation = 0.0
         self.current_target04_id = None
+        self.current_target04_rotation = 0.0
         self.current_target05_id = None
+        self.current_target05_rotation = 0.0
+        self.current_target06_id = None
+        self.current_ship_target_id = None
         self.current_air01_id = None
         self.current_air02_id = None
         self.current_heli_id = None
         self.target03_id = None
+        self.target03_rotation = 67.0
         self.target04_id = None
+        self.target04_rotation = 67.0
         self.target05_id = None
+        self.target05_rotation = 71.0
+        self.target06_id = None
+        self.ship_target_id = None
         self.air01_id = None
         self.air02_id = None
         self.heli_id = None
         self.current_horse_powers = 12000
         self.current_max_rpm = 15000
-        self.current_mass = 10000000
+        self.current_mass = 50000
         self.power_shift_active = True
         self.rapid_fire_active = True
         self.rapid_fire_time = 0.2
+        self.weapon_override_mode = "none"
+        self.weapon_override_current_donor_id = ""
+        self.weapon_override_current_weapon_blk = ""
+        self.weapon_override_donor_id = ""
+        self.naval_weapon_override_donor_id = ""
+        self.naval_weapon_override_current_donor_id = ""
+        self.naval_weapon_override_current_weapon_blk = ""
+        self.aircraft_weapon_override_donor_id = ""
+        self.aircraft_weapon_override_current_donor_id = ""
+        self.aircraft_weapon_override_current_weapon_blk = ""
+        self.velocity_override_active = False
+        self.current_velocity_speed = 2000
+        self.caliber_override_active = False
+        self.current_caliber = 0.12
         self.naval_war_mode_active = False
         self.naval_war_mode_cas_count = 8
         self.naval_war_mode_bomber_count = 27
@@ -674,9 +857,18 @@ class WarThunderTestDriveGUI(QMainWindow):
         update_action.triggered.connect(self.check_for_updates)
         file_menu.addAction(update_action)
         file_menu.addSeparator()
-        debug_action = QAction("Debug Info", self)
+        debug_action = QAction("[Debug] File Info", self)
         debug_action.triggered.connect(self.show_debug_info)
         file_menu.addAction(debug_action)
+        open_vehicles_action = QAction("[Debug] Open Ground Vehicle Folder", self)
+        open_vehicles_action.triggered.connect(self._debug_open_ground_vehicle_folder)
+        file_menu.addAction(open_vehicles_action)
+        open_missions_action = QAction("[Debug] Open UserMissions Folder", self)
+        open_missions_action.triggered.connect(self._debug_open_usermissions_folder)
+        file_menu.addAction(open_missions_action)
+        create_log_action = QAction("[Debug] Create Log", self)
+        create_log_action.triggered.connect(self._debug_create_log)
+        file_menu.addAction(create_log_action)
         file_menu.addSeparator()
         exit_action = QAction("Exit", self)
         exit_action.triggered.connect(self.close)
@@ -770,7 +962,7 @@ class WarThunderTestDriveGUI(QMainWindow):
         self._build_mission_tab()
         self._build_air_tab()
         self._build_ground_saved_tab()
-        self._build_ground_experimental_tab()
+        self._build_ground_experimental_combined_tab()
         self._build_naval_ship_tab()
         self._build_naval_targets_tab()
         self._build_naval_air_tab()
@@ -837,7 +1029,7 @@ class WarThunderTestDriveGUI(QMainWindow):
         current_layout.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.current_image_label = QLabel()
         self.current_image_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.current_image_label.setFixedSize(150, 150)
+        self.current_image_label.setFixedSize(120, 120)
         current_layout.addWidget(self.current_image_label)
         self.current_name_label = QLabel("Unknown")
         self.current_name_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
@@ -850,7 +1042,7 @@ class WarThunderTestDriveGUI(QMainWindow):
         selected_layout.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.selected_image_label = QLabel()
         self.selected_image_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.selected_image_label.setFixedSize(150, 150)
+        self.selected_image_label.setFixedSize(120, 120)
         selected_layout.addWidget(self.selected_image_label)
         self.selected_name_label = QLabel("-")
         self.selected_name_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
@@ -858,7 +1050,8 @@ class WarThunderTestDriveGUI(QMainWindow):
         selected_layout.addWidget(self.selected_name_label)
         right.addWidget(selected_group)
 
-        ammo_group = QGroupBox("Ammo Loadout")
+        self.ammo_group = QGroupBox("Ammo Loadout")
+        ammo_group = self.ammo_group
         ammo_layout = QVBoxLayout(ammo_group)
         ammo_layout.setSpacing(4)
 
@@ -936,16 +1129,16 @@ class WarThunderTestDriveGUI(QMainWindow):
         weather_row.addWidget(self.weather_combo)
         layout.addLayout(weather_row)
 
-        for group_label, img_attr, name_attr, slot in [
-            ("Ground Target (300m)", "target03_image_label", "target03_name_label", 3),
-            ("Ground Target (600m)", "target04_image_label", "target04_name_label", 4),
-            ("Ground Target (800m)", "target05_image_label", "target05_name_label", 5),
+        for group_label, img_attr, name_attr, slot, default_rot, spawn_deg in [
+            ("Ground Target (300m)", "target03_image_label", "target03_name_label", 3, 67, 67),
+            ("Ground Target (600m)", "target04_image_label", "target04_name_label", 4, 67, 67),
+            ("Ground Target (800m)", "target05_image_label", "target05_name_label", 5, 71, 71),
         ]:
             group = QGroupBox(group_label)
             group_layout = QHBoxLayout(group)
             img = QLabel()
             img.setAlignment(Qt.AlignmentFlag.AlignCenter)
-            img.setFixedSize(150, 150)
+            img.setFixedSize(120, 120)
             setattr(self, img_attr, img)
             group_layout.addWidget(img)
             info = QVBoxLayout()
@@ -956,7 +1149,51 @@ class WarThunderTestDriveGUI(QMainWindow):
             btn.clicked.connect(lambda _, n=slot: self.pick_target(n))
             info.addWidget(btn)
             group_layout.addLayout(info)
+
+            rot_layout = QVBoxLayout()
+            rot_label = QLabel(f"{default_rot}°")
+            rot_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            dial_attr = f"target0{slot}_dial"
+            label_attr = f"target0{slot}_rotation_label"
+            setattr(self, label_attr, rot_label)
+            rot_layout.addWidget(rot_label)
+            dial = QDial()
+            dial.setRange(0, 359)
+            dial.setWrapping(True)
+            dial.setSingleStep(1)
+            dial.setPageStep(45)
+            dial.setValue(default_rot)
+            dial.setFixedSize(80, 80)
+            dial.valueChanged.connect(lambda v, la=rot_label: la.setText(f"{v}°"))
+            setattr(self, dial_attr, dial)
+            rot_layout.addWidget(dial, alignment=Qt.AlignmentFlag.AlignCenter)
+            note = QLabel(f"{spawn_deg}° = Facing Spawn")
+            note.setStyleSheet("color: gray; font-size: 9px;")
+            note.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            rot_layout.addWidget(note)
+            default_btn = QPushButton("Return to Default")
+            default_btn.setFixedWidth(110)
+            default_btn.clicked.connect(lambda _, d=dial, v=default_rot: d.setValue(v))
+            rot_layout.addWidget(default_btn, alignment=Qt.AlignmentFlag.AlignCenter)
+            group_layout.addLayout(rot_layout)
+
             layout.addWidget(group)
+
+        # Moving Target (Target_06)
+        t6_group = QGroupBox("Moving Target")
+        t6_layout = QHBoxLayout(t6_group)
+        self.target06_image_label = QLabel()
+        self.target06_image_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.target06_image_label.setFixedSize(120, 120)
+        t6_layout.addWidget(self.target06_image_label)
+        t6_info = QVBoxLayout()
+        self.target06_name_label = QLabel("Not set")
+        t6_info.addWidget(self.target06_name_label)
+        t6_btn = QPushButton("Change...")
+        t6_btn.clicked.connect(lambda: self._pick_moving_naval_target("target06"))
+        t6_info.addWidget(t6_btn)
+        t6_layout.addLayout(t6_info)
+        layout.addWidget(t6_group)
 
         layout.addStretch()
         self.tab_widget.addTab(tab, "Ground Targets")
@@ -984,7 +1221,7 @@ class WarThunderTestDriveGUI(QMainWindow):
             group_layout = QHBoxLayout(group)
             img = QLabel()
             img.setAlignment(Qt.AlignmentFlag.AlignCenter)
-            img.setFixedSize(150, 150)
+            img.setFixedSize(120, 120)
             setattr(self, img_attr, img)
             group_layout.addWidget(img)
             info = QVBoxLayout()
@@ -997,8 +1234,24 @@ class WarThunderTestDriveGUI(QMainWindow):
             group_layout.addLayout(info)
             layout.addWidget(group)
 
+        # Naval Target (Ship_Target)
+        ship_group = QGroupBox("Naval Target")
+        ship_layout = QHBoxLayout(ship_group)
+        self.ship_target_image_label = QLabel()
+        self.ship_target_image_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.ship_target_image_label.setFixedSize(120, 120)
+        ship_layout.addWidget(self.ship_target_image_label)
+        ship_info = QVBoxLayout()
+        self.ship_target_name_label = QLabel("Not set")
+        ship_info.addWidget(self.ship_target_name_label)
+        ship_btn = QPushButton("Change...")
+        ship_btn.clicked.connect(lambda: self._pick_moving_naval_target("ship_target"))
+        ship_info.addWidget(ship_btn)
+        ship_layout.addLayout(ship_info)
+        layout.addWidget(ship_group)
+
         layout.addStretch()
-        self.tab_widget.addTab(tab, "Air Targets")
+        self.tab_widget.addTab(tab, "Air && Naval Target")
 
     # ── Ground: Tab — Saved ───────────────────────────────────────────────────
 
@@ -1103,7 +1356,19 @@ class WarThunderTestDriveGUI(QMainWindow):
 
     # ── Ground: Tab — Experimental ───────────────────────────────────────────
 
-    def _build_ground_experimental_tab(self):
+    def _build_ground_experimental_combined_tab(self):
+        """Build the Experimental tab containing Performance Override and Weapon Override sub-tabs."""
+        tab = QWidget()
+        layout = QVBoxLayout(tab)
+        layout.setContentsMargins(4, 4, 4, 4)
+        layout.setSpacing(0)
+        sub_tw = QTabWidget()
+        layout.addWidget(sub_tw)
+        self._build_ground_experimental_tab(sub_tw)
+        self._build_ground_weapon_override_tab(sub_tw)
+        self.tab_widget.addTab(tab, "Experimental")
+
+    def _build_ground_experimental_tab(self, tw):
         """Build the Experimental tab for the ground mission."""
         tab = QWidget()
         layout = QVBoxLayout(tab)
@@ -1172,24 +1437,24 @@ class WarThunderTestDriveGUI(QMainWindow):
         controls_layout.addLayout(rpm_row)
 
         mass_slider_row = QHBoxLayout()
-        mass_slider_row.addWidget(QLabel("100k"))
+        mass_slider_row.addWidget(QLabel("1t"))
         self.mass_slider = QSlider(Qt.Orientation.Horizontal)
         self.mass_slider.setMinimum(1)
         self.mass_slider.setMaximum(1000)
-        self.mass_slider.setValue(self.current_mass // 100000)
+        self.mass_slider.setValue(self.current_mass // 1000)
         self.mass_slider.setTickInterval(100)
         self.mass_slider.setTickPosition(QSlider.TickPosition.TicksBelow)
         mass_slider_row.addWidget(self.mass_slider)
-        mass_slider_row.addWidget(QLabel("100M"))
+        mass_slider_row.addWidget(QLabel("1000t"))
         controls_layout.addLayout(mass_slider_row)
 
         mass_row = QHBoxLayout()
         mass_row.addWidget(QLabel("Mass (kg):"))
         self.mass_spinbox = QSpinBox()
-        self.mass_spinbox.setMinimum(100000)
-        self.mass_spinbox.setMaximum(100000000)
+        self.mass_spinbox.setMinimum(1000)
+        self.mass_spinbox.setMaximum(1000000)
         self.mass_spinbox.setValue(self.current_mass)
-        self.mass_spinbox.setSingleStep(100000)
+        self.mass_spinbox.setSingleStep(1000)
         mass_row.addWidget(self.mass_spinbox)
         mass_row.addStretch()
         controls_layout.addLayout(mass_row)
@@ -1207,20 +1472,20 @@ class WarThunderTestDriveGUI(QMainWindow):
         self.horse_powers_spinbox.valueChanged.connect(self.horse_powers_slider.setValue)
         self.max_rpm_slider.valueChanged.connect(self.max_rpm_spinbox.setValue)
         self.max_rpm_spinbox.valueChanged.connect(self.max_rpm_slider.setValue)
-        self.mass_slider.valueChanged.connect(lambda v: self.mass_spinbox.setValue(v * 100000))
-        self.mass_spinbox.valueChanged.connect(lambda v: self.mass_slider.setValue(v // 100000))
+        self.mass_slider.valueChanged.connect(lambda v: self.mass_spinbox.setValue(v * 1000))
+        self.mass_spinbox.valueChanged.connect(lambda v: self.mass_slider.setValue(v // 1000))
         self.power_shift_checkbox.toggled.connect(self.engine_override_controls.setEnabled)
         self.engine_override_controls.setEnabled(False)
 
         layout.addWidget(power_group)
 
-        rapid_group = QGroupBox("Rapid Fire")
+        rapid_group = QGroupBox("Rapid Fire - (automatically reload and repair)")
         rapid_layout = QVBoxLayout(rapid_group)
 
         self.rapid_fire_checkbox = QCheckBox("Enable Rapid Fire")
         rapid_layout.addWidget(self.rapid_fire_checkbox)
 
-        rf_info = QLabel("Automatically restores your ammo on a periodic timer.\nLower interval = faster rearm. Default: 0.20s, Max: 10s")
+        rf_info = QLabel("Automatically reloads your ammo and repairs your vehicle on a periodic timer.\nLower interval = faster reload and repair. Default: 0.20s, Max: 10s")
         rf_info.setWordWrap(True)
         rapid_layout.addWidget(rf_info)
 
@@ -1266,13 +1531,295 @@ class WarThunderTestDriveGUI(QMainWindow):
 
         layout.addWidget(rapid_group)
         layout.addStretch()
-        self.tab_widget.addTab(tab, "Experimental")
+        tw.addTab(tab, "Performance Override")
+
+    # ── Ground: Tab — Weapon Override [Experimental] ─────────────────────────
+
+    def _build_ground_weapon_override_tab(self, tw):
+        """Build the Weapon Override [Experimental] tab for the ground mission."""
+        tab = QWidget()
+        layout = QVBoxLayout(tab)
+        layout.setContentsMargins(8, 8, 8, 8)
+        layout.setSpacing(10)
+
+        weapon_override_group = QGroupBox("Weapon Override")
+        wo_layout = QVBoxLayout(weapon_override_group)
+
+        self.wo_none_radio     = QRadioButton("None")
+        self.wo_ground_radio   = QRadioButton("Ground Weapons")
+        self.wo_naval_radio    = QRadioButton("Naval Weapons")
+        self.wo_aircraft_radio = QRadioButton("Aircraft Weapons")
+        self.wo_none_radio.setChecked(True)
+        wo_btn_group = QButtonGroup(self)
+        wo_btn_group.addButton(self.wo_none_radio)
+        wo_btn_group.addButton(self.wo_ground_radio)
+        wo_btn_group.addButton(self.wo_naval_radio)
+        wo_btn_group.addButton(self.wo_aircraft_radio)
+        wo_layout.addWidget(self.wo_none_radio)
+        wo_layout.addWidget(self.wo_ground_radio)
+        wo_layout.addWidget(self.wo_naval_radio)
+        wo_layout.addWidget(self.wo_aircraft_radio)
+
+        wo_info = QLabel("Replaces your vehicle's primary weapon with one from a donor vehicle.\nNote: Ammo Loadout will be locked while a weapon override is active.")
+        wo_info.setWordWrap(True)
+        wo_layout.addWidget(wo_info)
+
+        # Ground weapon controls
+        self.wo_ground_controls = QWidget()
+        wo_g_layout = QVBoxLayout(self.wo_ground_controls)
+        wo_g_layout.setContentsMargins(0, 4, 0, 0)
+        wo_g_donor_row = QHBoxLayout()
+        self.weapon_override_name_label = QLabel("Not set")
+        wo_g_donor_row.addWidget(self.weapon_override_name_label, 1)
+        wo_g_btn = QPushButton("Change...")
+        wo_g_btn.clicked.connect(self._pick_weapon_override_donor)
+        wo_g_donor_row.addWidget(wo_g_btn)
+        wo_g_layout.addLayout(wo_g_donor_row)
+        wo_g_weapon_row = QHBoxLayout()
+        wo_g_weapon_row.addWidget(QLabel("Weapon:"))
+        self.weapon_override_combo = QComboBox()
+        wo_g_weapon_row.addWidget(self.weapon_override_combo, 1)
+        wo_g_layout.addLayout(wo_g_weapon_row)
+        wo_layout.addWidget(self.wo_ground_controls)
+        self.wo_ground_controls.setVisible(False)
+
+        # Naval weapon controls
+        self.wo_naval_controls = QWidget()
+        wo_n_layout = QVBoxLayout(self.wo_naval_controls)
+        wo_n_layout.setContentsMargins(0, 4, 0, 0)
+        wo_n_donor_row = QHBoxLayout()
+        self.naval_weapon_override_name_label = QLabel("Not set")
+        wo_n_donor_row.addWidget(self.naval_weapon_override_name_label, 1)
+        wo_n_btn = QPushButton("Change...")
+        wo_n_btn.clicked.connect(self._pick_naval_weapon_override_donor)
+        wo_n_donor_row.addWidget(wo_n_btn)
+        wo_n_layout.addLayout(wo_n_donor_row)
+        wo_n_weapon_row = QHBoxLayout()
+        wo_n_weapon_row.addWidget(QLabel("Weapon:"))
+        self.naval_weapon_override_combo = QComboBox()
+        wo_n_weapon_row.addWidget(self.naval_weapon_override_combo, 1)
+        wo_n_layout.addLayout(wo_n_weapon_row)
+        wo_layout.addWidget(self.wo_naval_controls)
+        self.wo_naval_controls.setVisible(False)
+
+        # Aircraft weapon controls
+        self.wo_aircraft_controls = QWidget()
+        wo_a_layout = QVBoxLayout(self.wo_aircraft_controls)
+        wo_a_layout.setContentsMargins(0, 4, 0, 0)
+        wo_a_donor_row = QHBoxLayout()
+        self.aircraft_weapon_override_name_label = QLabel("Not set")
+        wo_a_donor_row.addWidget(self.aircraft_weapon_override_name_label, 1)
+        wo_a_btn = QPushButton("Change...")
+        wo_a_btn.clicked.connect(self._pick_aircraft_weapon_override_donor)
+        wo_a_donor_row.addWidget(wo_a_btn)
+        wo_a_layout.addLayout(wo_a_donor_row)
+        wo_a_weapon_row = QHBoxLayout()
+        wo_a_weapon_row.addWidget(QLabel("Weapon:"))
+        self.aircraft_weapon_override_combo = QComboBox()
+        wo_a_weapon_row.addWidget(self.aircraft_weapon_override_combo, 1)
+        wo_a_layout.addLayout(wo_a_weapon_row)
+        wo_layout.addWidget(self.wo_aircraft_controls)
+        self.wo_aircraft_controls.setVisible(False)
+
+        self.wo_none_radio.toggled.connect(lambda checked: self._on_wo_mode_changed("none", checked))
+        self.wo_ground_radio.toggled.connect(lambda checked: self._on_wo_mode_changed("ground", checked))
+        self.wo_naval_radio.toggled.connect(lambda checked: self._on_wo_mode_changed("naval", checked))
+        self.wo_aircraft_radio.toggled.connect(lambda checked: self._on_wo_mode_changed("aircraft", checked))
+
+        layout.addWidget(weapon_override_group)
+
+        # ── Velocity Override ──────────────────────────────────────────────────
+        velocity_group = QGroupBox("Velocity Override")
+        v_layout = QVBoxLayout(velocity_group)
+
+        self.velocity_override_checkbox = QCheckBox("Enable Velocity Override")
+        self.velocity_override_checkbox.setEnabled(False)
+        v_layout.addWidget(self.velocity_override_checkbox)
+
+        vo_info = QLabel("Overrides the projectile speed of the selected weapon.\nOnly available when a weapon override is active.")
+        vo_info.setWordWrap(True)
+        v_layout.addWidget(vo_info)
+
+        self.velocity_controls = QWidget()
+        v_controls_layout = QVBoxLayout(self.velocity_controls)
+        v_controls_layout.setContentsMargins(0, 4, 0, 0)
+        v_controls_layout.setSpacing(4)
+
+        speed_row = QHBoxLayout()
+        speed_row.addWidget(QLabel("Speed (m/s):"))
+        self.velocity_spinbox = QSpinBox()
+        self.velocity_spinbox.setRange(100, 5000)
+        self.velocity_spinbox.setValue(2000)
+        self.velocity_spinbox.setSingleStep(100)
+        speed_row.addWidget(self.velocity_spinbox)
+        v_controls_layout.addLayout(speed_row)
+
+        self.velocity_slider = QSlider(Qt.Orientation.Horizontal)
+        self.velocity_slider.setRange(100, 5000)
+        self.velocity_slider.setValue(2000)
+        self.velocity_slider.setSingleStep(100)
+        self.velocity_slider.setTickPosition(QSlider.TickPosition.TicksBelow)
+        self.velocity_slider.setTickInterval(500)
+        v_controls_layout.addWidget(self.velocity_slider)
+
+        v_labels_row = QHBoxLayout()
+        v_labels_row.addWidget(QLabel("100 m/s"))
+        v_labels_row.addStretch()
+        v_labels_row.addWidget(QLabel("5000 m/s"))
+        v_controls_layout.addLayout(v_labels_row)
+
+        self.velocity_controls.setEnabled(False)
+        v_layout.addWidget(self.velocity_controls)
+
+        self.velocity_slider.valueChanged.connect(self.velocity_spinbox.setValue)
+        self.velocity_spinbox.valueChanged.connect(self.velocity_slider.setValue)
+        self.velocity_override_checkbox.toggled.connect(
+            lambda checked: self.velocity_controls.setEnabled(checked)
+        )
+
+        # Caliber override
+        self.caliber_override_checkbox = QCheckBox("Caliber Override")
+        self.caliber_override_checkbox.setEnabled(False)
+        v_layout.addWidget(self.caliber_override_checkbox)
+
+        self.caliber_controls_widget = QWidget()
+        c_controls_layout = QHBoxLayout(self.caliber_controls_widget)
+        c_controls_layout.setContentsMargins(0, 0, 0, 0)
+        c_controls_layout.addWidget(QLabel("Caliber (m):"))
+        self.caliber_spinbox = QDoubleSpinBox()
+        self.caliber_spinbox.setRange(0.01, 10.0)
+        self.caliber_spinbox.setValue(0.12)
+        self.caliber_spinbox.setSingleStep(0.01)
+        self.caliber_spinbox.setDecimals(2)
+        c_controls_layout.addWidget(self.caliber_spinbox)
+        c_controls_layout.addStretch()
+        caliber_hint = QLabel("0.12 = 120 mm  |  1.0 = 1 m  |  10.0 = 10 m")
+        caliber_hint.setStyleSheet("color: gray;")
+        c_controls_layout.addWidget(caliber_hint)
+        self.caliber_controls_widget.setEnabled(False)
+        v_layout.addWidget(self.caliber_controls_widget)
+
+        self.caliber_override_checkbox.toggled.connect(
+            lambda checked: self.caliber_controls_widget.setEnabled(checked)
+        )
+
+        layout.addWidget(velocity_group)
+        layout.addStretch()
+        tw.addTab(tab, "Weapon Override")
 
     def _reset_engine_override_defaults(self):
         """Reset Engine Override spinboxes to their default values."""
         self.horse_powers_spinbox.setValue(12000)
         self.max_rpm_spinbox.setValue(15000)
-        self.mass_spinbox.setValue(10000000)
+        self.mass_spinbox.setValue(50000)
+
+    def _populate_weapon_override_combo(self, combo, vehicle_id, db_filename, select_blk=""):
+        """Fill a weapon combo from the given DB for vehicle_id, optionally pre-selecting select_blk."""
+        combo.blockSignals(True)
+        combo.clear()
+        db_path = os.path.join(self.assets_folder, db_filename)
+        if os.path.exists(db_path):
+            try:
+                with open(db_path, encoding="utf-8") as f:
+                    weapon_db = json.load(f)
+                for w in weapon_db.get(vehicle_id, []):
+                    combo.addItem(w["name"], w["blk"])
+                if select_blk:
+                    for i in range(combo.count()):
+                        if (combo.itemData(i) or "").lower() == select_blk.lower():
+                            combo.setCurrentIndex(i)
+                            break
+            except Exception:
+                pass
+        combo.blockSignals(False)
+
+    def _on_wo_mode_changed(self, mode, checked):
+        """Show the correct controls and strip override blocks immediately when None is selected."""
+        if not checked:
+            return
+        self.wo_ground_controls.setVisible(mode == "ground")
+        self.wo_naval_controls.setVisible(mode == "naval")
+        self.wo_aircraft_controls.setVisible(mode == "aircraft")
+        if hasattr(self, 'ammo_group'):
+            self.ammo_group.setEnabled(mode == "none")
+        if hasattr(self, 'velocity_override_checkbox'):
+            if mode == "none":
+                self.velocity_override_checkbox.setChecked(False)
+                self.velocity_override_checkbox.setEnabled(False)
+                self.velocity_controls.setEnabled(False)
+                self.caliber_override_checkbox.setChecked(False)
+                self.caliber_override_checkbox.setEnabled(False)
+                self.caliber_controls_widget.setEnabled(False)
+            else:
+                self.velocity_override_checkbox.setEnabled(True)
+                self.caliber_override_checkbox.setEnabled(True)
+        if mode == "none" and hasattr(self, 'test_drive_vehicle_file') and self.test_drive_vehicle_file:
+            if not os.path.exists(self.test_drive_vehicle_file):
+                return
+            try:
+                with open(self.test_drive_vehicle_file, 'r', encoding='utf-8') as f:
+                    vf_lines = f.readlines()
+                cleaned = []
+                depth = 0
+                in_block = False
+                for line in vf_lines:
+                    if not in_block:
+                        if '"@override:weapon_presets"' in line or '"@override:commonWeapons"' in line:
+                            in_block = True
+                            depth = line.count('{') - line.count('}')
+                            if depth <= 0:
+                                in_block = False
+                            continue
+                        cleaned.append(line)
+                    else:
+                        depth += line.count('{') - line.count('}')
+                        if depth <= 0:
+                            in_block = False
+                first_comment = next(
+                    (i for i, l in enumerate(cleaned) if l.lstrip().startswith('//')),
+                    len(cleaned)
+                )
+                content = [l for l in cleaned[1:first_comment] if l.strip()]
+                if content:
+                    cleaned = [cleaned[0]] + ['\n'] + content + ['\n'] + cleaned[first_comment:]
+                else:
+                    cleaned = [cleaned[0]] + ['\n'] + cleaned[first_comment:]
+                with open(self.test_drive_vehicle_file, 'w', encoding='utf-8') as f:
+                    f.writelines(cleaned)
+                self.weapon_override_mode                          = "none"
+                self.weapon_override_current_donor_id              = ""
+                self.weapon_override_current_weapon_blk            = ""
+                self.naval_weapon_override_current_donor_id        = ""
+                self.naval_weapon_override_current_weapon_blk      = ""
+                self.aircraft_weapon_override_current_donor_id     = ""
+                self.aircraft_weapon_override_current_weapon_blk   = ""
+            except Exception as e:
+                QMessageBox.warning(self, "Weapon Override", f"Could not update vehicle file:\n{e}")
+
+    def _pick_weapon_override_donor(self):
+        """Open vehicle picker to select the ground donor vehicle for weapon override."""
+        dialog = VehiclePickerDialog(self.tank_data, self, self.assets_folder, "Tank_Previews")
+        if dialog.exec():
+            self.weapon_override_donor_id = dialog.selected_id
+            self.weapon_override_name_label.setText(dialog.selected_name)
+            self._populate_weapon_override_combo(self.weapon_override_combo, dialog.selected_id, "Weapons2.0_DB.json")
+
+    def _pick_naval_weapon_override_donor(self):
+        """Open ship picker to select the naval donor for weapon override."""
+        dialog = VehiclePickerDialog(self.ship_data, self, self.assets_folder, "Ship_Previews")
+        if dialog.exec():
+            self.naval_weapon_override_donor_id = dialog.selected_id
+            self.naval_weapon_override_name_label.setText(dialog.selected_name)
+            self._populate_weapon_override_combo(self.naval_weapon_override_combo, dialog.selected_id, "NavalWeapons2.0_DB.json")
+
+    def _pick_aircraft_weapon_override_donor(self):
+        """Open aircraft picker to select the donor aircraft for weapon override."""
+        self.load_air_data()
+        dialog = VehiclePickerDialog(self.plane_data + self.heli_data, self, self.assets_folder, "Aircraft_Previews")
+        if dialog.exec():
+            self.aircraft_weapon_override_donor_id = dialog.selected_id
+            self.aircraft_weapon_override_name_label.setText(dialog.selected_name)
+            self._populate_weapon_override_combo(self.aircraft_weapon_override_combo, dialog.selected_id, "AircraftWeapons2.0_DB.json")
 
     # ── Naval: Tab — Experimental ─────────────────────────────────────────────
 
@@ -1352,13 +1899,13 @@ class WarThunderTestDriveGUI(QMainWindow):
 
         layout.addWidget(war_mode_group)
 
-        rapid_group = QGroupBox("Rapid Fire")
+        rapid_group = QGroupBox("Rapid Fire - (automatically reload and repair)")
         rapid_layout = QVBoxLayout(rapid_group)
 
         self.naval_rapid_fire_checkbox = QCheckBox("Enable Rapid Fire")
         rapid_layout.addWidget(self.naval_rapid_fire_checkbox)
 
-        rf_info = QLabel("Automatically restores your ammo on a periodic timer.\nLower interval = faster rearm. Default: 0.10s, Max: 10s")
+        rf_info = QLabel("Automatically reloads your ammo and repairs your vehicle on a periodic timer.\nLower interval = faster reload and repair. Default: 0.10s, Max: 10s")
         rf_info.setWordWrap(True)
         rapid_layout.addWidget(rf_info)
 
@@ -1469,7 +2016,7 @@ class WarThunderTestDriveGUI(QMainWindow):
         if dialog.exec():
             self.naval_shooter_ids[index] = dialog.selected_id
             self.naval_shooter_name_labels[index].setText(dialog.selected_name)
-            self.load_image(dialog.selected_id, self.naval_shooter_image_labels[index], "Ship_Previews")
+            self.load_image(dialog.selected_id, self.naval_shooter_image_labels[index], "Ship_Previews", size=60)
 
     # ── Naval: Tab — Ship ─────────────────────────────────────────────────────
 
@@ -1532,7 +2079,7 @@ class WarThunderTestDriveGUI(QMainWindow):
         naval_current_layout.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.naval_current_image_label = QLabel()
         self.naval_current_image_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.naval_current_image_label.setFixedSize(150, 150)
+        self.naval_current_image_label.setFixedSize(120, 120)
         naval_current_layout.addWidget(self.naval_current_image_label)
         self.naval_current_name_label = QLabel("Unknown")
         self.naval_current_name_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
@@ -1545,7 +2092,7 @@ class WarThunderTestDriveGUI(QMainWindow):
         naval_selected_layout.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.naval_selected_image_label = QLabel()
         self.naval_selected_image_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.naval_selected_image_label.setFixedSize(150, 150)
+        self.naval_selected_image_label.setFixedSize(120, 120)
         naval_selected_layout.addWidget(self.naval_selected_image_label)
         self.naval_selected_name_label = QLabel("-")
         self.naval_selected_name_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
@@ -1607,7 +2154,7 @@ class WarThunderTestDriveGUI(QMainWindow):
             group_layout = QHBoxLayout(group)
             img = QLabel()
             img.setAlignment(Qt.AlignmentFlag.AlignCenter)
-            img.setFixedSize(150, 150)
+            img.setFixedSize(120, 120)
             setattr(self, img_attr, img)
             group_layout.addWidget(img)
             info = QVBoxLayout()
@@ -1644,7 +2191,7 @@ class WarThunderTestDriveGUI(QMainWindow):
         ship_layout = QHBoxLayout(ship_group)
         self.naval_target04_image_label = QLabel()
         self.naval_target04_image_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.naval_target04_image_label.setFixedSize(150, 150)
+        self.naval_target04_image_label.setFixedSize(120, 120)
         ship_layout.addWidget(self.naval_target04_image_label)
         ship_info = QVBoxLayout()
         self.naval_target04_name_label = QLabel("Not set")
@@ -1660,7 +2207,7 @@ class WarThunderTestDriveGUI(QMainWindow):
         cas_layout = QHBoxLayout(cas_group)
         self.naval_air01_image_label = QLabel()
         self.naval_air01_image_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.naval_air01_image_label.setFixedSize(150, 150)
+        self.naval_air01_image_label.setFixedSize(120, 120)
         cas_layout.addWidget(self.naval_air01_image_label)
         cas_info = QVBoxLayout()
         self.naval_air01_name_label = QLabel("Not set")
@@ -1679,7 +2226,7 @@ class WarThunderTestDriveGUI(QMainWindow):
         bomber_layout = QHBoxLayout(bomber_group)
         self.naval_air02_image_label = QLabel()
         self.naval_air02_image_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.naval_air02_image_label.setFixedSize(150, 150)
+        self.naval_air02_image_label.setFixedSize(120, 120)
         bomber_layout.addWidget(self.naval_air02_image_label)
         bomber_info = QVBoxLayout()
         self.naval_air02_name_label = QLabel("Not set")
@@ -2071,7 +2618,7 @@ class WarThunderTestDriveGUI(QMainWindow):
             QMessageBox.critical(self, "Error", "Tank2.0_DB.json not found in the Assets folder.")
             return
 
-        ammo_names_path = os.path.join(self.assets_folder, "ammo_names.json")
+        ammo_names_path = os.path.join(self.assets_folder, "AmmoNames2.0_DB.json")
         if os.path.exists(ammo_names_path):
             with open(ammo_names_path, encoding="utf-8") as f:
                 self._ammo_names = json.load(f)
@@ -2107,6 +2654,26 @@ class WarThunderTestDriveGUI(QMainWindow):
         self.rapid_fire_dial.setValue(max(1, round(self.rapid_fire_time / 0.1)))
         self.rapid_fire_checkbox.setChecked(self.rapid_fire_active)
         self.rapid_fire_controls.setEnabled(self.rapid_fire_active)
+        self.wo_none_radio.setChecked(self.weapon_override_mode == "none")
+        self.wo_ground_radio.setChecked(self.weapon_override_mode == "ground")
+        self.wo_naval_radio.setChecked(self.weapon_override_mode == "naval")
+        self.wo_aircraft_radio.setChecked(self.weapon_override_mode == "aircraft")
+        self.wo_ground_controls.setVisible(self.weapon_override_mode == "ground")
+        self.wo_naval_controls.setVisible(self.weapon_override_mode == "naval")
+        self.wo_aircraft_controls.setVisible(self.weapon_override_mode == "aircraft")
+        self.ammo_group.setEnabled(self.weapon_override_mode == "none")
+        if self.aircraft_weapon_override_current_donor_id:
+            donor_name = next((p["name"] for p in self.plane_data + self.heli_data if p["ID"] == self.aircraft_weapon_override_current_donor_id), self.aircraft_weapon_override_current_donor_id)
+            self.aircraft_weapon_override_name_label.setText(donor_name)
+            self._populate_weapon_override_combo(self.aircraft_weapon_override_combo, self.aircraft_weapon_override_current_donor_id, "AircraftWeapons2.0_DB.json", self.aircraft_weapon_override_current_weapon_blk)
+        if self.weapon_override_current_donor_id:
+            donor_name = next((t["name"] for t in self.tank_data if t["ID"] == self.weapon_override_current_donor_id), self.weapon_override_current_donor_id)
+            self.weapon_override_name_label.setText(donor_name)
+            self._populate_weapon_override_combo(self.weapon_override_combo, self.weapon_override_current_donor_id, "Weapons2.0_DB.json", self.weapon_override_current_weapon_blk)
+        if self.naval_weapon_override_current_donor_id:
+            donor_name = next((s["name"] for s in self.ship_data if s["ID"] == self.naval_weapon_override_current_donor_id), self.naval_weapon_override_current_donor_id)
+            self.naval_weapon_override_name_label.setText(donor_name)
+            self._populate_weapon_override_combo(self.naval_weapon_override_combo, self.naval_weapon_override_current_donor_id, "NavalWeapons2.0_DB.json", self.naval_weapon_override_current_weapon_blk)
 
     # ── Naval: UI Initialisation ──────────────────────────────────────────────
 
@@ -2159,7 +2726,7 @@ class WarThunderTestDriveGUI(QMainWindow):
             self.naval_shooter_checkboxes[i].setChecked(not self.naval_shooter_current_disabled[i])
             name = next((s["name"] for s in self.ship_data if s["ID"] == uid), uid or "Not set")
             self.naval_shooter_name_labels[i].setText(name)
-            self.load_image(uid or None, self.naval_shooter_image_labels[i], "Ship_Previews")
+            self.load_image(uid or None, self.naval_shooter_image_labels[i], "Ship_Previews", size=60)
 
     # ── Ground: .blk Reading ──────────────────────────────────────────────────
 
@@ -2177,12 +2744,17 @@ class WarThunderTestDriveGUI(QMainWindow):
 
         self.current_environment = None
         self.current_weather = None
-        self.current_target03_id = None
-        self.current_target04_id = None
-        self.current_target05_id = None
-        self.current_air01_id = None
-        self.current_air02_id = None
-        self.current_heli_id = None
+        self.current_target03_id       = None
+        self.current_target03_rotation = 0.0
+        self.current_target04_id       = None
+        self.current_target04_rotation = 0.0
+        self.current_target05_id       = None
+        self.current_target05_rotation = 0.0
+        self.current_target06_id       = None
+        self.current_ship_target_id    = None
+        self.current_air01_id          = None
+        self.current_air02_id          = None
+        self.current_heli_id           = None
 
         try:
             with open(self.test_drive_file, 'r', encoding='utf-8') as f:
@@ -2230,11 +2802,52 @@ class WarThunderTestDriveGUI(QMainWindow):
                             self.current_max_rpm = int(float(line.split(':r=')[1].rstrip('}\n').strip()))
                         except Exception:
                             pass
-                    elif '@override:mass' in line:
+                    elif '@override:Mass' in line:
                         try:
                             self.current_mass = int(float(line.split(':r=')[1].rstrip('}\n').strip()))
                         except Exception:
                             pass
+
+                # Weapon override
+                self.weapon_override_current_donor_id = ""
+                self.weapon_override_current_weapon_blk = ""
+                self.naval_weapon_override_current_donor_id = ""
+                self.naval_weapon_override_current_weapon_blk = ""
+                self.aircraft_weapon_override_current_donor_id = ""
+                self.aircraft_weapon_override_current_weapon_blk = ""
+                _has_override = any('"@override:weapon_presets"' in l for l in vf_lines)
+                _weapon_blk = ""
+                _donor_blk = ""
+                for line in vf_lines:
+                    if '"@override:blk"' in line and ('tankmodels' in line.lower() or 'flightmodels' in line.lower() or ('units' in line.lower() and 'ships' in line.lower())):
+                        for part in line.split('"'):
+                            pl = part.lower()
+                            if pl.startswith('gamedata') and ('tankmodels' in pl or 'flightmodels' in pl or 'ships' in pl):
+                                _donor_blk = part.split('/')[-1].replace('.blk', '')
+                                break
+                    elif '"@override:blk"' in line and ('models_weapons' in line.lower() or 'bombguns' in line.lower() or 'rocketguns' in line.lower()):
+                        for part in line.split('"'):
+                            pl = part.lower()
+                            if pl.startswith('gamedata') and ('models_weapons' in pl or 'bombguns' in pl or 'rocketguns' in pl):
+                                _weapon_blk = part
+                                break
+                if _has_override and 'navalmodels' in _weapon_blk.lower():
+                    self.weapon_override_mode = "naval"
+                    self.naval_weapon_override_current_donor_id   = _donor_blk
+                    self.naval_weapon_override_current_weapon_blk = _weapon_blk
+                    self.naval_weapon_override_donor_id = _donor_blk
+                elif _has_override and ('bombguns' in _weapon_blk.lower() or 'rocketguns' in _weapon_blk.lower()):
+                    self.weapon_override_mode = "aircraft"
+                    self.aircraft_weapon_override_current_donor_id   = _donor_blk
+                    self.aircraft_weapon_override_current_weapon_blk = _weapon_blk
+                    self.aircraft_weapon_override_donor_id = _donor_blk
+                elif _has_override:
+                    self.weapon_override_mode = "ground"
+                    self.weapon_override_current_donor_id   = _donor_blk
+                    self.weapon_override_current_weapon_blk = _weapon_blk
+                    self.weapon_override_donor_id = _donor_blk
+                else:
+                    self.weapon_override_mode = "none"
 
             weapons_start = self.Current_Test_Vehicle.find("weapons:t=")
             if weapons_start != -1:
@@ -2286,12 +2899,17 @@ class WarThunderTestDriveGUI(QMainWindow):
                             pass
 
             s = tank_models_start
-            self.current_target03_id = self._read_field_in_block(content, "Target_03",    "unit_class:t=", s)
-            self.current_target04_id = self._read_field_in_block(content, "Target_04",    "unit_class:t=", s)
-            self.current_target05_id = self._read_field_in_block(content, "Target_05",    "unit_class:t=", s)
-            self.current_air01_id    = self._read_field_in_block(content, "Target_Air_01","unit_class:t=", s)
-            self.current_air02_id    = self._read_field_in_block(content, "Target_Air_02","unit_class:t=", s)
-            self.current_heli_id     = self._read_field_in_block(content, "Heli_Target",  "unit_class:t=", s)
+            self.current_target03_id       = self._read_field_in_block(content, "Target_03", "unit_class:t=", s)
+            self.current_target03_rotation = self._read_tm_rotation(content, "Target_03")
+            self.current_target04_id       = self._read_field_in_block(content, "Target_04", "unit_class:t=", s)
+            self.current_target04_rotation = self._read_tm_rotation(content, "Target_04")
+            self.current_target05_id       = self._read_field_in_block(content, "Target_05", "unit_class:t=", s)
+            self.current_target05_rotation = self._read_tm_rotation(content, "Target_05")
+            self.current_target06_id    = self._read_field_in_block(content, "Target_06",    "unit_class:t=", s)
+            self.current_ship_target_id = self._read_field_in_block(content, "Ship_Target",  "unit_class:t=")
+            self.current_air01_id       = self._read_field_in_block(content, "Target_Air_01","unit_class:t=", s)
+            self.current_air02_id       = self._read_field_in_block(content, "Target_Air_02","unit_class:t=", s)
+            self.current_heli_id        = self._read_field_in_block(content, "Heli_Target",  "unit_class:t=", s)
 
         except Exception as e:
             QMessageBox.critical(self, "Error", f"Error reading ground mission file: {str(e)}")
@@ -2489,6 +3107,49 @@ class WarThunderTestDriveGUI(QMainWindow):
         new_block = block.replace(block[f_start:f_end], f'{field_key}"{new_value}"')
         return content[:name_pos] + new_block + content[block_end:]
 
+    def _read_tm_rotation(self, content, block_name):
+        """Read the Y-axis rotation angle (degrees) from the tm:m line of a named block."""
+        name_pos = content.find(f'name:t="{block_name}"')
+        if name_pos == -1:
+            return 0.0
+        block_end = content.find('}', name_pos)
+        block = content[name_pos:block_end]
+        tm_start = block.find('tm:m=')
+        if tm_start == -1:
+            return 0.0
+        tm_end = block.find('\n', tm_start)
+        tm_line = block[tm_start:tm_end]
+        nums = [float(x) for x in re.findall(r'-?\d+\.?\d*(?:[eE][+-]?\d+)?', tm_line)]
+        if len(nums) < 9:
+            return 0.0
+        # r00 = nums[0] = cos θ,  r20 = nums[6] = sin θ
+        angle = math.degrees(math.atan2(nums[6], nums[0]))
+        return angle % 360
+
+    def _update_tm_rotation(self, content, block_name, angle_degrees):
+        """Rewrite the tm:m line of a named block with a new Y-axis rotation, keeping position."""
+        name_pos = content.find(f'name:t="{block_name}"')
+        if name_pos == -1:
+            return content
+        block_end = content.find('}', name_pos)
+        block = content[name_pos:block_end]
+        tm_start = block.find('tm:m=')
+        if tm_start == -1:
+            return content
+        tm_end = block.find('\n', tm_start)
+        tm_line = block[tm_start:tm_end]
+        nums = [float(x) for x in re.findall(r'-?\d+\.?\d*(?:[eE][+-]?\d+)?', tm_line)]
+        if len(nums) < 12:
+            return content
+        px, py, pz = nums[9], nums[10], nums[11]
+        a = math.radians(angle_degrees)
+        c, s = math.cos(a), math.sin(a)
+        new_line = (f'tm:m=[[{c:.6f}, 0, {-s:.6f}] [0, 1, 0] [{s:.6f}, 0, {c:.6f}]'
+                    f' [{px}, {py}, {pz}]]')
+        abs_start = name_pos + tm_start
+        abs_end   = name_pos + tm_end
+        return content[:abs_start] + new_line + content[abs_end:]
+
     # ── Ground: Data Loading ──────────────────────────────────────────────────
 
     def load_tank_data(self, tank_db_path):
@@ -2506,18 +3167,35 @@ class WarThunderTestDriveGUI(QMainWindow):
             QMessageBox.critical(self, "Error", f"Error loading tank data: {str(e)}")
 
     def populate_target_combos(self):
-        """Initialise the three ground target labels and images from current mission state."""
-        self.target03_id = self.current_target03_id
-        self.target04_id = self.current_target04_id
-        self.target05_id = self.current_target05_id
+        """Initialise the ground target labels and images from current mission state."""
+        self.target03_id       = self.current_target03_id
+        self.target03_rotation = self.current_target03_rotation
+        self.target04_id       = self.current_target04_id
+        self.target04_rotation = self.current_target04_rotation
+        self.target05_id       = self.current_target05_id
+        self.target05_rotation = self.current_target05_rotation
+        self.target06_id       = self.current_target06_id
+        self.ship_target_id    = self.current_ship_target_id
+        for slot, attr in [(3, "03"), (4, "04"), (5, "05")]:
+            rot = getattr(self, f"target{attr}_rotation")
+            dial = getattr(self, f"target0{slot}_dial")
+            label = getattr(self, f"target0{slot}_rotation_label")
+            dial.blockSignals(True)
+            dial.setValue(int(round(rot)))
+            dial.blockSignals(False)
+            label.setText(f"{int(round(rot))}°")
 
         self.target03_name_label.setText(next((t["name"] for t in self.tank_data if t["ID"] == self.target03_id), self.target03_id or "Not set"))
         self.target04_name_label.setText(next((t["name"] for t in self.tank_data if t["ID"] == self.target04_id), self.target04_id or "Not set"))
         self.target05_name_label.setText(next((t["name"] for t in self.tank_data if t["ID"] == self.target05_id), self.target05_id or "Not set"))
+        self.target06_name_label.setText(next((t["name"] for t in self.tank_data if t["ID"] == self.target06_id), self.target06_id or "Not set"))
+        self.ship_target_name_label.setText(next((s["name"] for s in self.ship_data if s["ID"] == self.ship_target_id), self.ship_target_id or "Not set"))
 
         self.load_image(self.target03_id, self.target03_image_label)
         self.load_image(self.target04_id, self.target04_image_label)
         self.load_image(self.target05_id, self.target05_image_label)
+        self.load_image(self.target06_id, self.target06_image_label)
+        self.load_image(self.ship_target_id, self.ship_target_image_label, "Ship_Previews")
 
     def pick_target(self, target_num):
         """
@@ -2538,6 +3216,21 @@ class WarThunderTestDriveGUI(QMainWindow):
                 setattr(self, id_attr, dialog.selected_id)
                 getattr(self, name_attr).setText(dialog.selected_name)
                 self.load_image(dialog.selected_id, getattr(self, img_attr))
+
+    def _pick_moving_naval_target(self, key):
+        """Open picker for Moving Target (tank_data) or Naval Target (ship_data)."""
+        if key == "target06":
+            dialog = VehiclePickerDialog(self.tank_data, self, self.assets_folder, "Tank_Previews")
+            if dialog.exec():
+                self.target06_id = dialog.selected_id
+                self.target06_name_label.setText(dialog.selected_name)
+                self.load_image(dialog.selected_id, self.target06_image_label)
+        elif key == "ship_target":
+            dialog = VehiclePickerDialog(self.ship_data, self, self.assets_folder, "Ship_Previews")
+            if dialog.exec():
+                self.ship_target_id = dialog.selected_id
+                self.ship_target_name_label.setText(dialog.selected_name)
+                self.load_image(dialog.selected_id, self.ship_target_image_label, "Ship_Previews")
 
     def load_air_data(self):
         """Load Plane2.0_DB.json and Helicopter2.0_DB.json for the ground air tab."""
@@ -3240,12 +3933,14 @@ class WarThunderTestDriveGUI(QMainWindow):
             getattr(self, name_attr).setText(v["name"])
             self.load_image(v["ID"], getattr(self, img_attr), subfolder)
 
-        pick(self.tank_data,  "target03_id", "target03_name_label", "target03_image_label")
-        pick(self.tank_data,  "target04_id", "target04_name_label", "target04_image_label")
-        pick(self.tank_data,  "target05_id", "target05_name_label", "target05_image_label")
-        pick(self.plane_data, "air01_id",    "air01_name_label",    "air01_image_label",    "Aircraft_Previews")
-        pick(self.plane_data, "air02_id",    "air02_name_label",    "air02_image_label",    "Aircraft_Previews")
-        pick(self.heli_data,  "heli_id",     "heli_name_label",     "heli_image_label",     "Aircraft_Previews")
+        pick(self.tank_data,  "target03_id",    "target03_name_label",    "target03_image_label")
+        pick(self.tank_data,  "target04_id",    "target04_name_label",    "target04_image_label")
+        pick(self.tank_data,  "target05_id",    "target05_name_label",    "target05_image_label")
+        pick(self.tank_data,  "target06_id",    "target06_name_label",    "target06_image_label")
+        pick(self.ship_data,  "ship_target_id", "ship_target_name_label", "ship_target_image_label", "Ship_Previews")
+        pick(self.plane_data, "air01_id",       "air01_name_label",       "air01_image_label",       "Aircraft_Previews")
+        pick(self.plane_data, "air02_id",       "air02_name_label",       "air02_image_label",       "Aircraft_Previews")
+        pick(self.heli_data,  "heli_id",        "heli_name_label",        "heli_image_label",        "Aircraft_Previews")
 
     def _random_ground_time_weather(self):
         """Randomise the time of day and weather selectors for the ground mission."""
@@ -3285,12 +3980,14 @@ class WarThunderTestDriveGUI(QMainWindow):
             "ammo_counts": [s.value() for s in self.ammo_slot_spinboxes],
             "environment": self.time_combo.currentText(),
             "weather":     self.weather_combo.currentText(),
-            "target03_id": self.target03_id,
-            "target04_id": self.target04_id,
-            "target05_id": self.target05_id,
-            "air01_id":    self.air01_id,
-            "air02_id":    self.air02_id,
-            "heli_id":     self.heli_id,
+            "target03_id":    self.target03_id,
+            "target04_id":    self.target04_id,
+            "target05_id":    self.target05_id,
+            "target06_id":    self.target06_id,
+            "ship_target_id": self.ship_target_id,
+            "air01_id":       self.air01_id,
+            "air02_id":       self.air02_id,
+            "heli_id":        self.heli_id,
         }
         self.user_ground_presets.append(preset)
         self._save_saved_lists()
@@ -3336,12 +4033,14 @@ class WarThunderTestDriveGUI(QMainWindow):
                     val.setCurrentIndex(idx)
 
         for id_attr, name_attr, img_attr, preset_key, data, subfolder in [
-            ("target03_id", "target03_name_label", "target03_image_label", "target03_id", self.tank_data,  "Tank_Previews"),
-            ("target04_id", "target04_name_label", "target04_image_label", "target04_id", self.tank_data,  "Tank_Previews"),
-            ("target05_id", "target05_name_label", "target05_image_label", "target05_id", self.tank_data,  "Tank_Previews"),
-            ("air01_id",    "air01_name_label",    "air01_image_label",    "air01_id",    self.plane_data, "Aircraft_Previews"),
-            ("air02_id",    "air02_name_label",    "air02_image_label",    "air02_id",    self.plane_data, "Aircraft_Previews"),
-            ("heli_id",     "heli_name_label",     "heli_image_label",     "heli_id",     self.heli_data,  "Aircraft_Previews"),
+            ("target03_id",    "target03_name_label",    "target03_image_label",    "target03_id",    self.tank_data,  "Tank_Previews"),
+            ("target04_id",    "target04_name_label",    "target04_image_label",    "target04_id",    self.tank_data,  "Tank_Previews"),
+            ("target05_id",    "target05_name_label",    "target05_image_label",    "target05_id",    self.tank_data,  "Tank_Previews"),
+            ("target06_id",    "target06_name_label",    "target06_image_label",    "target06_id",    self.tank_data,  "Tank_Previews"),
+            ("ship_target_id", "ship_target_name_label", "ship_target_image_label", "ship_target_id", self.ship_data,  "Ship_Previews"),
+            ("air01_id",       "air01_name_label",       "air01_image_label",       "air01_id",       self.plane_data, "Aircraft_Previews"),
+            ("air02_id",       "air02_name_label",       "air02_image_label",       "air02_id",       self.plane_data, "Aircraft_Previews"),
+            ("heli_id",        "heli_name_label",        "heli_image_label",        "heli_id",        self.heli_data,  "Aircraft_Previews"),
         ]:
             tid = preset.get(preset_key)
             if tid:
@@ -3694,7 +4393,7 @@ class WarThunderTestDriveGUI(QMainWindow):
             self.naval_shooter_checkboxes[i].setChecked(enabled)
             name = next((s["name"] for s in self.ship_data if s["ID"] == uid), uid or "Not set")
             self.naval_shooter_name_labels[i].setText(name)
-            self.load_image(uid or None, self.naval_shooter_image_labels[i], "Ship_Previews")
+            self.load_image(uid or None, self.naval_shooter_image_labels[i], "Ship_Previews", size=60)
 
     def _naval_load_preset(self):
         """Load the selected user preset into all naval UI slots."""
@@ -3734,9 +4433,9 @@ class WarThunderTestDriveGUI(QMainWindow):
 
     # ── Shared: Image Loading ─────────────────────────────────────────────────
 
-    def load_image(self, vehicle_id, label, subfolder="Tank_Previews"):
+    def load_image(self, vehicle_id, label, subfolder="Tank_Previews", size=120):
         """
-        Load and display a vehicle preview image scaled to 150×150 px.
+        Load and display a vehicle preview image scaled to size×size px.
 
         Falls back to default.png in the same subfolder if the specific
         image is not found. Clears the label if neither exists.
@@ -3745,6 +4444,7 @@ class WarThunderTestDriveGUI(QMainWindow):
             vehicle_id (str | None): Vehicle ID used as the filename (without .png).
             label      (QLabel):     Label widget to display the image on.
             subfolder  (str):        Subfolder inside Vehicle_Previews/.
+            size       (int):        Square size in pixels to scale the image to.
         """
         if not vehicle_id:
             label.clear()
@@ -3753,7 +4453,7 @@ class WarThunderTestDriveGUI(QMainWindow):
         if not os.path.exists(image_path):
             image_path = os.path.join(self.assets_folder, "Vehicle_Previews", subfolder, "default.png")
         if os.path.exists(image_path):
-            pixmap = QPixmap(image_path).scaled(150, 150, Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation)
+            pixmap = QPixmap(image_path).scaled(size, size, Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation)
             label.setPixmap(pixmap)
         else:
             label.clear()
@@ -3798,9 +4498,19 @@ class WarThunderTestDriveGUI(QMainWindow):
             return True
         if self.target03_id != self.current_target03_id:
             return True
+        if abs(self.target03_dial.value() - self.current_target03_rotation) > 0.5:
+            return True
         if self.target04_id != self.current_target04_id:
             return True
+        if abs(self.target04_dial.value() - self.current_target04_rotation) > 0.5:
+            return True
         if self.target05_id != self.current_target05_id:
+            return True
+        if abs(self.target05_dial.value() - self.current_target05_rotation) > 0.5:
+            return True
+        if self.target06_id != self.current_target06_id:
+            return True
+        if self.ship_target_id != self.current_ship_target_id:
             return True
         if self.air01_id != self.current_air01_id:
             return True
@@ -3820,6 +4530,35 @@ class WarThunderTestDriveGUI(QMainWindow):
             return True
         if abs(self.rapid_fire_spinbox.value() - self.rapid_fire_time) > 0.001:
             return True
+        current_mode = ("ground"   if self.wo_ground_radio.isChecked()   else
+                        "naval"    if self.wo_naval_radio.isChecked()    else
+                        "aircraft" if self.wo_aircraft_radio.isChecked() else "none")
+        if current_mode != self.weapon_override_mode:
+            return True
+        if current_mode == "ground" and (
+            self.weapon_override_donor_id != self.weapon_override_current_donor_id
+            or (self.weapon_override_combo.currentData() or "") != self.weapon_override_current_weapon_blk
+        ):
+            return True
+        if current_mode == "naval" and (
+            self.naval_weapon_override_donor_id != self.naval_weapon_override_current_donor_id
+            or (self.naval_weapon_override_combo.currentData() or "") != self.naval_weapon_override_current_weapon_blk
+        ):
+            return True
+        if current_mode == "aircraft" and (
+            self.aircraft_weapon_override_donor_id != self.aircraft_weapon_override_current_donor_id
+            or (self.aircraft_weapon_override_combo.currentData() or "") != self.aircraft_weapon_override_current_weapon_blk
+        ):
+            return True
+        if hasattr(self, 'velocity_override_checkbox') and current_mode != "none":
+            if self.velocity_override_checkbox.isChecked() != self.velocity_override_active:
+                return True
+            if self.velocity_override_checkbox.isChecked() and self.velocity_spinbox.value() != self.current_velocity_speed:
+                return True
+            if self.caliber_override_checkbox.isChecked() != self.caliber_override_active:
+                return True
+            if self.caliber_override_checkbox.isChecked() and abs(self.caliber_spinbox.value() - self.current_caliber) > 0.001:
+                return True
         for i, (combo, spin) in enumerate(zip(self.ammo_slot_combos, self.ammo_slot_spinboxes)):
             t = combo.currentData() or combo.currentText()
             b = "" if t in ("-- None --", "No ammo data", "Stock") else t
@@ -3895,13 +4634,21 @@ class WarThunderTestDriveGUI(QMainWindow):
                     content = self.update_vehicle_in_content(content, f"AI_Shooting_0{i}", self.Selected_Vehicle_ID, weapons_default)
 
             for block_name, id_attr in [
-                ("Target_03",     "target03_id"), ("Target_04",     "target04_id"), ("Target_05",  "target05_id"),
-                ("Target_Air_01", "air01_id"),    ("Target_Air_02", "air02_id"),    ("Heli_Target","heli_id"),
+                ("Target_03",     "target03_id"),    ("Target_04",     "target04_id"),    ("Target_05",  "target05_id"),
+                ("Target_06",     "target06_id"),
+                ("Target_Air_01", "air01_id"),        ("Target_Air_02", "air02_id"),        ("Heli_Target","heli_id"),
             ]:
                 vid = getattr(self, id_attr)
                 if vid:
                     content = self._update_field_in_block(content, block_name, "unit_class:t=", vid)
                     content = self._update_field_in_block(content, block_name, "weapons:t=", f"{vid}_default")
+            if self.ship_target_id:
+                content = self._update_field_in_block(content, "Ship_Target", "unit_class:t=", self.ship_target_id)
+                content = self._update_field_in_block(content, "Ship_Target", "weapons:t=", f"{self.ship_target_id}_default")
+
+            content = self._update_tm_rotation(content, "Target_03", self.target03_dial.value())
+            content = self._update_tm_rotation(content, "Target_04", self.target04_dial.value())
+            content = self._update_tm_rotation(content, "Target_05", self.target05_dial.value())
 
             content = self.update_top_level_value(content, "environment:t=", self.time_combo.currentText())
             content = self.update_top_level_value(content, "weather:t=", self.weather_combo.currentText())
@@ -3947,22 +4694,28 @@ class WarThunderTestDriveGUI(QMainWindow):
             if ps_changed:
                 with open(self.test_drive_vehicle_file, 'r', encoding='utf-8') as f:
                     vf_lines = f.readlines()
-                _ps_keys = ('@override:mass', '@override:horsePowers', '@override:maxRPM', '@override:minRPM')
+                _ps_keys = ('@override:Mass', '@override:horsePowers', '@override:maxRPM', '@override:minRPM')
                 cleaned = [l for l in vf_lines if not any(k in l for k in _ps_keys)]
                 # Strip accumulated blank lines before the comment block to prevent stacking
                 first_comment = next(
                     (i for i, l in enumerate(cleaned) if l.lstrip().startswith('//')),
                     len(cleaned)
                 )
-                cleaned = [cleaned[0]] + [l for l in cleaned[1:first_comment] if l.strip()] + cleaned[first_comment:]
+                content = [l for l in cleaned[1:first_comment] if l.strip()]
                 if ps_checked:
                     ps_lines = [
-                        f'"@override:mass":r={new_mass}\n',
+                        f'"@override:VehiclePhys" {{ "@override:Mass" {{ "@override:Empty":r={new_mass}}}}}\n',
                         f'"@override:VehiclePhys" {{ "@override:engine" {{ "@override:horsePowers":r={new_hp}}}}}\n',
                         f'"@override:VehiclePhys" {{ "@override:engine" {{ "@override:maxRPM":r={new_max_rpm}}}}}\n',
                         '"@override:VehiclePhys" { "@override:engine" { "@override:minRPM":r=3000}}\n',
                     ]
+                    cleaned = [cleaned[0]] + content + cleaned[first_comment:]
                     cleaned = cleaned[:1] + ['\n'] + ps_lines + ['\n'] + cleaned[1:]
+                else:
+                    if content:
+                        cleaned = [cleaned[0]] + ['\n'] + content + ['\n'] + cleaned[first_comment:]
+                    else:
+                        cleaned = [cleaned[0]] + ['\n'] + cleaned[first_comment:]
                 with open(self.test_drive_vehicle_file, 'w', encoding='utf-8') as f:
                     f.writelines(cleaned)
                 self.current_horse_powers = new_hp if ps_checked else self.current_horse_powers
@@ -3970,20 +4723,184 @@ class WarThunderTestDriveGUI(QMainWindow):
                 self.current_mass         = new_mass if ps_checked else self.current_mass
                 self.power_shift_active   = ps_checked
 
+            # Weapon override
+            new_mode  = ("ground"   if self.wo_ground_radio.isChecked()   else
+                         "naval"    if self.wo_naval_radio.isChecked()    else
+                         "aircraft" if self.wo_aircraft_radio.isChecked() else "none")
+            wo_donor  = self.weapon_override_donor_id or self.weapon_override_current_donor_id
+            wo_weapon = self.weapon_override_combo.currentData() or self.weapon_override_current_weapon_blk
+            nw_donor  = self.naval_weapon_override_donor_id or self.naval_weapon_override_current_donor_id
+            nw_weapon = self.naval_weapon_override_combo.currentData() or self.naval_weapon_override_current_weapon_blk
+            aw_donor  = self.aircraft_weapon_override_donor_id or self.aircraft_weapon_override_current_donor_id
+            aw_weapon = self.aircraft_weapon_override_combo.currentData() or self.aircraft_weapon_override_current_weapon_blk
+            active_donor  = wo_donor if new_mode == "ground" else nw_donor if new_mode == "naval" else aw_donor if new_mode == "aircraft" else ""
+            active_weapon = wo_weapon if new_mode == "ground" else nw_weapon if new_mode == "naval" else aw_weapon if new_mode == "aircraft" else ""
+            donor_path = (f"gameData/units/tankmodels/{active_donor}.blk" if new_mode == "ground"
+                          else f"gameData/units/ships/{active_donor}.blk" if new_mode == "naval"
+                          else f"gamedata/flightmodels/{active_donor}.blk" if new_mode == "aircraft" else "")
+            velocity_enabled = (
+                hasattr(self, 'velocity_override_checkbox') and
+                self.velocity_override_checkbox.isChecked() and
+                new_mode != "none"
+            )
+            caliber_enabled = (
+                hasattr(self, 'caliber_override_checkbox') and
+                self.caliber_override_checkbox.isChecked() and
+                new_mode != "none"
+            )
+            new_velocity_speed = self.velocity_spinbox.value() if hasattr(self, 'velocity_spinbox') else 2000
+            new_caliber = self.caliber_spinbox.value() if hasattr(self, 'caliber_spinbox') else 0.12
+            wo_changed = new_mode != self.weapon_override_mode or (
+                new_mode == "ground"   and (wo_donor != self.weapon_override_current_donor_id or wo_weapon != self.weapon_override_current_weapon_blk)
+            ) or (
+                new_mode == "naval"    and (nw_donor != self.naval_weapon_override_current_donor_id or nw_weapon != self.naval_weapon_override_current_weapon_blk)
+            ) or (
+                new_mode == "aircraft" and (aw_donor != self.aircraft_weapon_override_current_donor_id or aw_weapon != self.aircraft_weapon_override_current_weapon_blk)
+            ) or (
+                new_mode != "none" and (
+                    velocity_enabled != self.velocity_override_active or
+                    (velocity_enabled and new_velocity_speed != self.current_velocity_speed) or
+                    caliber_enabled != self.caliber_override_active or
+                    (caliber_enabled and abs(new_caliber - self.current_caliber) > 0.001)
+                )
+            )
+            if wo_changed:
+                with open(self.test_drive_vehicle_file, 'r', encoding='utf-8') as f:
+                    vf_lines = f.readlines()
+                cleaned = []
+                depth = 0
+                in_block = False
+                for line in vf_lines:
+                    if not in_block:
+                        if '"@override:weapon_presets"' in line or '"@override:commonWeapons"' in line:
+                            in_block = True
+                            depth = line.count('{') - line.count('}')
+                            if depth <= 0:
+                                in_block = False
+                            continue
+                        cleaned.append(line)
+                    else:
+                        depth += line.count('{') - line.count('}')
+                        if depth <= 0:
+                            in_block = False
+                first_comment = next(
+                    (i for i, l in enumerate(cleaned) if l.lstrip().startswith('//')),
+                    len(cleaned)
+                )
+                cleaned = [cleaned[0]] + [l for l in cleaned[1:first_comment] if l.strip()] + ['\n'] + cleaned[first_comment:]
+                if new_mode != "none" and active_donor and active_weapon:
+                    # Velocity/caliber override: update Ask3ladBigWeaponSir.blk and redirect commonWeapons to it
+                    if velocity_enabled or caliber_enabled:
+                        include_path = active_weapon.replace('\\', '/')
+                        if include_path.lower().startswith('gamedata/'):
+                            include_path = 'gamedata/' + include_path[9:]
+                        elif include_path.startswith('gameData/'):
+                            include_path = 'gamedata/' + include_path[9:]
+                        vo_blk_path = os.path.join(
+                            self._wt_dir, 'content', 'pkg_local',
+                            'gameData', 'weapons', 'ask3lad', 'Ask3ladBigWeaponSir.blk'
+                        )
+                        s = new_velocity_speed
+                        c = new_caliber
+                        vo_content = f'include "#/develop/gameBase/{include_path}"\n'
+                        if velocity_enabled:
+                            vo_content += (
+                                f'\n'
+                                f'//Regular Ammo Override\n'
+                                f'"@override:bullet" {{ "@override:speed":r={s}}}\n'
+                                f'\n'
+                                f'//Rocket Override (SturmTiger)\n'
+                                f'"@override:bullet" {{ "@override:rocket" {{ "@override:startSpeed":r={s}}}}}\n'
+                                f'"@override:bullet" {{ "@override:rocket" {{ "@override:maxSpeed":r={s}}}}}\n'
+                                f'"@override:bullet" {{ "@override:rocket" {{ "@override:endSpeed":r={s}}}}}\n'
+                                f'\n'
+                                f'//Rocket Override (RBT-5)\n'
+                                f'"@override:rocket" {{ "@override:startSpeed":r={s}}}\n'
+                                f'"@override:rocket" {{ "@override:maxSpeed":r={s}}}\n'
+                                f'"@override:rocket" {{ "@override:endSpeed":r={s}}}\n'
+                            )
+                        if caliber_enabled:
+                            vo_content += (
+                                f'\n'
+                                f'//Caliber Override\n'
+                                f'"@override:bullet" {{ "@override:caliber":r={c}}}\n'
+                            )
+                        with open(vo_blk_path, 'w', encoding='utf-8') as f:
+                            f.write(vo_content)
+                        effective_weapon = 'gameData/weapons/ask3lad/Ask3ladBigWeaponSir.blk'
+                        self.velocity_override_active = velocity_enabled
+                        self.current_velocity_speed = s
+                        self.caliber_override_active = caliber_enabled
+                        self.current_caliber = c
+                    else:
+                        effective_weapon = active_weapon
+                        self.velocity_override_active = False
+                        self.caliber_override_active = False
+                    wo_lines = [
+                        f'"@override:weapon_presets" {{ "@override:preset[1]" {{ "@override:name":t = "{self.Current_Vehicle_ID}_default"}}}}\n',
+                        f'"@override:weapon_presets" {{ "@override:preset[1]" {{ "@override:blk":t = "{donor_path}"}}}}\n',
+                        '\n',
+                        f'"@override:commonWeapons" {{ "@override:Weapon[1]" {{ "@override:trigger":t = "gunner0"}}}}\n',
+                        f'"@override:commonWeapons" {{ "@override:Weapon[1]" {{ "@override:blk":t = "{effective_weapon}"}}}}\n',
+                        '\n',
+                    ]
+                    cleaned = cleaned[:1] + ['\n'] + wo_lines + cleaned[1:]
+                with open(self.test_drive_vehicle_file, 'w', encoding='utf-8') as f:
+                    f.writelines(cleaned)
+                if new_mode == "ground":
+                    self.weapon_override_current_donor_id   = active_donor
+                    self.weapon_override_current_weapon_blk = active_weapon
+                elif new_mode == "naval":
+                    self.naval_weapon_override_current_donor_id   = active_donor
+                    self.naval_weapon_override_current_weapon_blk = active_weapon
+                elif new_mode == "aircraft":
+                    self.aircraft_weapon_override_current_donor_id   = active_donor
+                    self.aircraft_weapon_override_current_weapon_blk = active_weapon
+                else:
+                    self.weapon_override_current_donor_id             = ""
+                    self.weapon_override_current_weapon_blk           = ""
+                    self.naval_weapon_override_current_donor_id       = ""
+                    self.naval_weapon_override_current_weapon_blk     = ""
+                    self.aircraft_weapon_override_current_donor_id    = ""
+                    self.aircraft_weapon_override_current_weapon_blk  = ""
+                    self.velocity_override_active = False
+                    self.caliber_override_active = False
+                self.weapon_override_mode = new_mode
+
             if self.Selected_Vehicle_ID:
                 self.Current_Vehicle_ID = self.Selected_Vehicle_ID
                 self.current_name_label.setText(next((t["name"] for t in self.tank_data if t["ID"] == self.Current_Vehicle_ID), self.Current_Vehicle_ID))
                 self.load_image(self.Current_Vehicle_ID, self.current_image_label)
                 self._ground_add_recently_used(self.Current_Vehicle_ID)
+                # Update @override:name if weapon override is active
+                if self.weapon_override_mode != "none" and os.path.exists(self.test_drive_vehicle_file):
+                    try:
+                        with open(self.test_drive_vehicle_file, 'r', encoding='utf-8') as f:
+                            vf_content = f.read()
+                        if '"@override:name"' in vf_content:
+                            old_start = vf_content.find('"@override:name":t = "')
+                            if old_start != -1:
+                                val_start = old_start + len('"@override:name":t = "')
+                                val_end = vf_content.find('"', val_start)
+                                vf_content = vf_content[:val_start] + f"{self.Current_Vehicle_ID}_default" + vf_content[val_end:]
+                            with open(self.test_drive_vehicle_file, 'w', encoding='utf-8') as f:
+                                f.write(vf_content)
+                    except Exception:
+                        pass
 
             self.current_environment = self.time_combo.currentText()
             self.current_weather     = self.weather_combo.currentText()
-            self.current_target03_id = self.target03_id
-            self.current_target04_id = self.target04_id
-            self.current_target05_id = self.target05_id
-            self.current_air01_id    = self.air01_id
-            self.current_air02_id    = self.air02_id
-            self.current_heli_id     = self.heli_id
+            self.current_target03_id       = self.target03_id
+            self.current_target03_rotation = float(self.target03_dial.value())
+            self.current_target04_id       = self.target04_id
+            self.current_target04_rotation = float(self.target04_dial.value())
+            self.current_target05_id       = self.target05_id
+            self.current_target05_rotation = float(self.target05_dial.value())
+            self.current_target06_id       = self.target06_id
+            self.current_ship_target_id    = self.ship_target_id
+            self.current_air01_id       = self.air01_id
+            self.current_air02_id       = self.air02_id
+            self.current_heli_id        = self.heli_id
             if self.Selected_Vehicle_ID:
                 self.current_bullets = slot_bullets
                 self.current_counts  = slot_counts
@@ -4538,13 +5455,213 @@ class WarThunderTestDriveGUI(QMainWindow):
         except Exception:
             db_stamp = "Unknown"
 
+        wt_dir = os.path.dirname(os.path.dirname(self.test_drive_file)) if self.test_drive_file else None
+
         lines = ["File Status\n" + "─" * 44]
-        for label, path in files:
-            lines.append(f"{label}:\n\n  {status(path)}\n  {path or '(none)'}")
+        for i, (label, path) in enumerate(files):
+            entry = f"{label}:\n\n  {status(path)}\n  {path or '(none)'}"
+            lines.append(("\n" + entry) if i > 0 else entry)
         lines.append("\n" + "─" * 44)
-        lines.append(f"DB version:  {db_stamp}")
+        lines.append(f"App version:  v{APP_VERSION}")
+        lines.append(f"DB version:   {db_stamp}")
+        lines.append(f"WT directory: {wt_dir or '(not set)'}")
 
         QMessageBox.information(self, "Debug Info", "\n".join(lines))
+
+    def _debug_create_log(self):
+        """Write a manual debug snapshot to Logs/debug_YYYY-MM-DD_HH-MM-SS.txt and open the folder."""
+        try:
+            os.makedirs(_LOGS_DIR, exist_ok=True)
+            timestamp  = datetime.datetime.now()
+            log_path   = os.path.join(_LOGS_DIR, f"debug_{timestamp.strftime('%Y-%m-%d_%H-%M-%S')}.txt")
+
+            def _val(v): return v or "(not set)"
+            def _exists(p): return ("✓ Found" if os.path.exists(p) else "✗ Not found") if p else "✗ Not set"
+
+            def _extract_you_block(mission_path, you_name="You"):
+                """Extract unit_class and weapons from the named You block in a mission file."""
+                if not mission_path or not os.path.exists(mission_path):
+                    return "  (file not set or not found)"
+                try:
+                    with open(mission_path, encoding="utf-8") as f:
+                        lines = f.readlines()
+                    you_idx = next((i for i, l in enumerate(lines) if f'name:t="{you_name}"' in l), None)
+                    if you_idx is None:
+                        return f'  (name:t="{you_name}" block not found)'
+                    unit_class = weapons = "(not found)"
+                    for l in lines[you_idx:you_idx + 15]:
+                        if "unit_class" in l:
+                            unit_class = l.strip()
+                        elif "weapons" in l:
+                            weapons = l.strip()
+                    return f"  {unit_class}\n  {weapons}"
+                except Exception as e:
+                    return f"  (Could not read: {e})"
+
+            # DB version
+            try:
+                with open(os.path.join(self.assets_folder, "db_version.json"), encoding="utf-8") as f:
+                    db_ver = json.load(f)
+                db_stamp = f"v{db_ver.get('version','?')}  {db_ver.get('date','?')}  {db_ver.get('time','')}".strip()
+            except Exception:
+                db_stamp = "Unknown"
+
+            # Ammo slots
+            ammo_slots = ""
+            for i in range(4):
+                ammo_slots += f"    Slot {i+1}: {self.current_bullets[i] or '(empty)'}  x{self.current_counts[i]}\n"
+
+            # Naval shooters
+            shooter_lines = ""
+            ship_labels = ["Ship 1","Ship 2","Ship 3","Ship 4","Ship 5","Ship 6","Carrier 1","Carrier 2"]
+            for i in range(8):
+                enabled = not self.naval_shooter_current_disabled[i]
+                shooter_lines += f"    {ship_labels[i]}: {'Enabled' if enabled else 'Disabled'}  {_val(self.naval_shooter_current_ids[i])}\n"
+
+            # Weapon override blk contents
+            big_weapon_blk_path = ""
+            big_weapon_blk = ""
+            if getattr(self, '_wt_dir', None):
+                big_weapon_blk_path = os.path.join(
+                    self._wt_dir, 'content', 'pkg_local',
+                    'gameData', 'weapons', 'ask3lad', 'Ask3ladBigWeaponSir.blk'
+                )
+                if os.path.exists(big_weapon_blk_path):
+                    try:
+                        with open(big_weapon_blk_path, encoding="utf-8") as f:
+                            big_weapon_blk = f.read()
+                    except Exception as e:
+                        big_weapon_blk = f"(Could not read: {e})"
+                else:
+                    big_weapon_blk = "(not found)"
+            else:
+                big_weapon_blk = "(WT directory not set)"
+
+            # Ground vehicle blk contents
+            ground_blk = ""
+            if self.test_drive_vehicle_file and os.path.exists(self.test_drive_vehicle_file):
+                try:
+                    with open(self.test_drive_vehicle_file, encoding="utf-8") as f:
+                        ground_blk = f.read()
+                except Exception as e:
+                    ground_blk = f"(Could not read: {e})"
+            else:
+                ground_blk = "(not set or not found)"
+
+            # Naval vehicle blk contents
+            naval_blk = ""
+            if self.naval_vehicle_file and os.path.exists(self.naval_vehicle_file):
+                try:
+                    with open(self.naval_vehicle_file, encoding="utf-8") as f:
+                        naval_blk = f.read()
+                except Exception as e:
+                    naval_blk = f"(Could not read: {e})"
+            else:
+                naval_blk = "(not set or not found)"
+
+            wt_dir = os.path.dirname(os.path.dirname(self.test_drive_file)) if self.test_drive_file else "(not set)"
+            mode   = "Ground" if (hasattr(self, "mode_tabs") and self.mode_tabs.currentIndex() == 0) else "Naval"
+
+            report = (
+                f"{'=' * 60}\n"
+                f"DEBUG LOG\n"
+                f"Timestamp:    {timestamp.strftime('%Y-%m-%d %H:%M:%S')}\n"
+                f"App version:  v{APP_VERSION}\n"
+                f"DB version:   {db_stamp}\n"
+                f"Active mode:  {mode}\n"
+                f"\n"
+                f"--- File Paths ---\n"
+                f"WT directory:         {wt_dir}\n"
+                f"Ground mission:       {_val(self.test_drive_file)}  [{_exists(self.test_drive_file)}]\n"
+                f"Ground vehicle file:  {_val(self.test_drive_vehicle_file)}  [{_exists(self.test_drive_vehicle_file)}]\n"
+                f"Naval mission:        {_val(self.naval_mission_file)}  [{_exists(self.naval_mission_file)}]\n"
+                f"Naval vehicle file:   {_val(self.naval_vehicle_file)}  [{_exists(self.naval_vehicle_file)}]\n"
+                f"Weapon override blk:  {_val(big_weapon_blk_path)}  [{_exists(big_weapon_blk_path)}]\n"
+                f"\n"
+                f"--- Ground State ---\n"
+                f"Vehicle (in mission): {_val(self.Current_Vehicle_ID)}\n"
+                f"Vehicle (selected):   {_val(self.Selected_Vehicle_ID)}\n"
+                f"Environment:          {_val(self.current_environment)}\n"
+                f"Weather:              {_val(self.current_weather)}\n"
+                f"Ammo loadout:\n{ammo_slots}"
+                f"Target 300m:          {_val(self.current_target03_id)}\n"
+                f"Target 600m:          {_val(self.current_target04_id)}\n"
+                f"Target 800m:          {_val(self.current_target05_id)}\n"
+                f"Moving target:        {_val(self.current_target06_id)}\n"
+                f"Naval target:         {_val(self.current_ship_target_id)}\n"
+                f"Air 5km:              {_val(self.current_air01_id)}\n"
+                f"Air 2.5km:            {_val(self.current_air02_id)}\n"
+                f"Helicopter 2km:       {_val(self.current_heli_id)}\n"
+                f"Engine override:      {'Enabled' if self.power_shift_active else 'Disabled'}\n"
+                f"  Horsepower:         {self.current_horse_powers} HP\n"
+                f"  Max RPM:            {self.current_max_rpm}\n"
+                f"  Mass:               {self.current_mass} kg\n"
+                f"Rapid fire:           {'Enabled' if self.rapid_fire_active else 'Disabled'}  interval={self.rapid_fire_time}s\n"
+                f"Weapon override:      {self.weapon_override_mode}\n"
+                f"  Donor (ground):     {_val(self.weapon_override_current_donor_id)}\n"
+                f"  Weapon (ground):    {_val(self.weapon_override_current_weapon_blk)}\n"
+                f"  Donor (naval):      {_val(self.naval_weapon_override_current_donor_id)}\n"
+                f"  Weapon (naval):     {_val(self.naval_weapon_override_current_weapon_blk)}\n"
+                f"  Donor (aircraft):   {_val(self.aircraft_weapon_override_current_donor_id)}\n"
+                f"  Weapon (aircraft):  {_val(self.aircraft_weapon_override_current_weapon_blk)}\n"
+                f"\n"
+                f"--- Naval State ---\n"
+                f"Ship (in mission):    {_val(self.naval_current_vehicle_id)}\n"
+                f"Ship (selected):      {_val(self.naval_selected_vehicle_id)}\n"
+                f"Environment:          {_val(self.naval_current_environment)}\n"
+                f"Weather:              {_val(self.naval_current_weather)}\n"
+                f"Target 5km:           {_val(self.naval_current_target01_id)}\n"
+                f"Target 10km:          {_val(self.naval_current_target02_id)}\n"
+                f"Target 15km:          {_val(self.naval_current_target03_id)}\n"
+                f"Moving target:        {_val(self.naval_current_target04_id)}\n"
+                f"CAS aircraft:         {_val(self.naval_current_air01_id)}\n"
+                f"CAS weapons:          {_val(self.naval_current_air01_weapons)}\n"
+                f"Bomber aircraft:      {_val(self.naval_current_air02_id)}\n"
+                f"Bomber weapons:       {_val(self.naval_current_air02_weapons)}\n"
+                f"War mode:             {'Enabled' if self.naval_war_mode_active else 'Disabled'}\n"
+                f"  CAS count:          {self.naval_war_mode_cas_count}\n"
+                f"  Bomber count:       {self.naval_war_mode_bomber_count}\n"
+                f"Rapid fire:           {'Enabled' if self.naval_rapid_fire_active else 'Disabled'}  interval={self.naval_rapid_fire_time}s\n"
+                f"Shooters:\n{shooter_lines}"
+                f"\n"
+                f"--- Ground Mission: You Block ---\n"
+                f"{_extract_you_block(self.test_drive_file)}\n"
+                f"\n"
+                f"--- Naval Mission: You Block ---\n"
+                f"{_extract_you_block(self.naval_mission_file, 'You_Naval')}\n"
+                f"\n"
+                f"--- Ground Vehicle File ---\n"
+                f"{ground_blk}\n"
+                f"--- Naval Vehicle File ---\n"
+                f"{naval_blk}\n"
+                f"--- Weapon Override File (Ask3ladBigWeaponSir.blk) ---\n"
+                f"{big_weapon_blk}\n"
+            )
+
+            with open(log_path, "w", encoding="utf-8") as f:
+                f.write(report)
+
+            os.startfile(_LOGS_DIR)
+            QMessageBox.information(self, "Debug Log Created", f"Log saved to:\n{log_path}")
+
+        except Exception as e:
+            QMessageBox.warning(self, "Debug Log", f"Could not create log:\n{e}")
+
+    def _debug_open_ground_vehicle_folder(self):
+        """Open the folder containing the ground vehicle .blk file in Explorer."""
+        path = self.test_drive_vehicle_file
+        if path and os.path.exists(path):
+            os.startfile(os.path.dirname(path))
+        else:
+            QMessageBox.warning(self, "Debug", "Ground vehicle file not set or not found.")
+
+    def _debug_open_usermissions_folder(self):
+        """Open the UserMissions/Ask3lad folder in Explorer."""
+        path = self.test_drive_file
+        if path and os.path.exists(path):
+            os.startfile(os.path.dirname(path))
+        else:
+            QMessageBox.warning(self, "Debug", "UserMissions folder not set or not found.")
 
     def show_about(self):
         """Show the About / Credits dialog."""
@@ -4565,7 +5682,7 @@ class WarThunderTestDriveGUI(QMainWindow):
         title.setFont(font)
         layout.addWidget(title)
 
-        version = QLabel("Version 2.3")
+        version = QLabel("Version 2.4")
         version.setAlignment(Qt.AlignmentFlag.AlignCenter)
         layout.addWidget(version)
 
@@ -4671,6 +5788,7 @@ class WarThunderTestDriveGUI(QMainWindow):
             "  • TheUnsocialEngineer\n"
             "  • Gszabi99\n"
             "  • One Tap Eoka\n"
+            "  • IForgotMyName\n"
             "  • Lensterboi\n"
             "  • TheGreenlandicGamer\n"
             "  • Lionstripes\n"
@@ -4753,7 +5871,7 @@ class WarThunderTestDriveGUI(QMainWindow):
         layout.addSpacing(6)
 
         log = QLabel(
-            "Version 2.3\n"
+            "Version 2.4\n"
             "―――――――――――――――――――――――――――――\n"
             "  General\n"
             "  • Full UI redesign with tabbed layout\n"
@@ -4777,6 +5895,7 @@ class WarThunderTestDriveGUI(QMainWindow):
             "  • Added app version check on startup\n"
             "  • Added Import / Export for user presets\n"
             "  • Added Custom Map toggle button\n"
+            "  • Added crash log system (Logs/ folder)\n"
             "  • Improved search bar for vehicles and ships\n\n"
             "  Ground\n"
             "  • Added 3 ground target slots (300m/600m/800m)\n"
@@ -4785,7 +5904,9 @@ class WarThunderTestDriveGUI(QMainWindow):
             "  • Added Themed Presets (WW1 to Modern)\n"
             "  • Added Experimental tab with Engine Override\n"
             "  • Added Multi-slot Ammo Loadout support\n"
-            "  • Added auto-respawn for ground targets\n\n"
+            "  • Added auto-respawn for ground targets\n"
+            "  • Added Weapon Override with 3 modes:\n"
+            "    Ground Weapons, Naval Weapons, Aircraft Weapons\n\n"
             "  Naval\n"
             "  • Added full Naval Test Drive support\n"
             "  • Added 3 static target slots (5km/10km/15km)\n"
@@ -4949,6 +6070,7 @@ def _apply_theme(dark):
 # ── Entry Point ───────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
+    sys.excepthook = _crash_handler
     app = QApplication(sys.argv)
     app.setStyle("Fusion")
     app.setPalette(_light_palette())
